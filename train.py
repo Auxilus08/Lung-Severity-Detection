@@ -29,6 +29,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 
@@ -43,43 +44,65 @@ from models.multitask_unet import build_seg_model
 #  Combined Loss
 # ═══════════════════════════════════════════════════════════════════════════
 
-class CombinedSegLoss(nn.Module):
-    """Dice + CrossEntropy for one segmentation head."""
+class FocalLoss(nn.Module):
+    """Focal Loss — down-weights easy (majority class) predictions."""
 
-    def __init__(self, num_classes, class_weights=None):
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # class weights tensor
+
+    def forward(self, logits, target):
+        ce_loss = F.cross_entropy(logits, target, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)  # probability of correct class
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+
+class CombinedSegLoss(nn.Module):
+    """Dice + Focal Loss for one segmentation head.
+    
+    Focal Loss focuses learning on hard examples (minority classes),
+    preventing the model from over-predicting majority classes.
+    """
+
+    def __init__(self, num_classes, class_weights=None, focal_gamma=2.0):
         super().__init__()
         self.dice = DiceLoss(
             to_onehot_y=True, softmax=True,
             include_background=False, reduction="mean",
         )
-        self.ce = nn.CrossEntropyLoss(weight=class_weights)
+        self.focal = FocalLoss(gamma=focal_gamma, alpha=class_weights)
 
     def forward(self, logits, target):
-        return self.dice(logits, target.unsqueeze(1)) + self.ce(logits, target)
+        return self.dice(logits, target.unsqueeze(1)) + self.focal(logits, target)
 
 
 class MultiTaskLoss(nn.Module):
     """
-    L = w_A × (Dice+CE)_pathology  +  w_B × (Dice+CE)_infection
+    L = w_A × (Dice+Focal)_pathology  +  w_B × (Dice+Focal)_infection
 
-    Both heads are ALWAYS trained (unlike the old version that disabled Task A).
+    Uses Focal Loss instead of CE to combat class imbalance and
+    over-segmentation. Higher weights for rare classes (PE, Consolidation).
     """
 
     def __init__(self, cfg: TrainConfig, device: torch.device):
         super().__init__()
-        self.w_a = cfg.task_a_weight  # always > 0
+        self.w_a = cfg.task_a_weight
         self.w_b = cfg.task_b_weight
 
-        # Task A: 4-class pathology (BG, GGO, Consolidation, PE)
-        pathology_weights = torch.tensor([0.5, 2.0, 3.0, 3.0], device=device)
-        self.loss_pathology = CombinedSegLoss(4, pathology_weights)
+        # Task A: 4-class pathology — aggressive weights for rare classes
+        # BG=87%, GGO=8%, Consol=4%, PE=1% → inverse frequency weighting
+        pathology_weights = torch.tensor([0.3, 4.0, 8.0, 15.0], device=device)
+        self.loss_pathology = CombinedSegLoss(4, pathology_weights, focal_gamma=2.0)
 
-        # Task B: 2-class infection (Healthy, Infected)
-        infection_weights = torch.tensor(cfg.lesion_ce_weights, device=device)
-        self.loss_infection = CombinedSegLoss(2, infection_weights)
+        # Task B: 2-class infection
+        infection_weights = torch.tensor([0.5, 3.0], device=device)
+        self.loss_infection = CombinedSegLoss(2, infection_weights, focal_gamma=2.0)
 
-        print(f"[loss] Task A (pathology, 4-class) weight={self.w_a:.1f}")
-        print(f"[loss] Task B (infection, binary)   weight={self.w_b:.1f}")
+        print(f"[loss] Task A (pathology, Focal γ=2.0) weight={self.w_a:.1f}")
+        print(f"[loss]   class weights: BG=0.3, GGO=4.0, Consol=8.0, PE=15.0")
+        print(f"[loss] Task B (infection, Focal γ=2.0) weight={self.w_b:.1f}")
 
     def forward(self, path_logits, inf_logits, path_target, inf_target):
         l_a = self.loss_pathology(path_logits, path_target)
