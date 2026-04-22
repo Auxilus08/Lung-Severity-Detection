@@ -1,28 +1,24 @@
 """
-train.py — Training Loop for Step 4: The Diagnostician
-========================================================
+train.py — Training Loop for Multi-Task U-Net Segmentation
+============================================================
 
-Trains the Multi-Task U-Net segmentation model:
-    Head A → 5-lobe anatomical mapping    (6 classes)
-    Head B → binary lesion detection      (2 classes)
+Train the Multi-Task U-Net with TWO decoder heads:
+    Head A → pathology detection  (4 classes: BG, GGO, Consolidation, PE)
+    Head B → binary infection     (2 classes: Healthy, Infected)
 
-Optionally chains frozen DnCNN + SRGAN before the U-Net during training
-(--use_enhancement) to match inference-time conditions.
+The MedSeg dataset provides pathology masks with labels:
+    0=BG, 1=GGO, 2=Consolidation, 3=Pleural Effusion
 
-If lobe annotations are NOT available (MedSeg dataset has pathology labels
-only), Task A loss is zeroed out and only Task B trains. The lobe decoder
-can later be fine-tuned on a lobe-annotated dataset.
+Task A trains directly on these labels.
+Task B collapses them to binary: any > 0 → Infected.
 
 Usage
 -----
-    # Train with NIfTI data directly
-    python train.py --data_dir ./data --epochs 150 --batch_size 4
+    # Train from NIfTI directly (100 slices, ~4GB GPU)
+    python train.py --data_dir ./data --epochs 150 --batch_size 2
 
-    # Train with preprocessed .npy (faster)
-    python train.py --use_npy --preprocessed_dir ./preprocessed --epochs 150
-
-    # Train with enhancement pipeline
-    python train.py --data_dir ./data --epochs 150 --use_enhancement
+    # Resume from checkpoint
+    python train.py --data_dir ./data --epochs 150 --resume checkpoints/best_model.pth
 """
 
 from __future__ import annotations
@@ -34,15 +30,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 from monai.losses import DiceLoss
 
-from config import TrainConfig, SegConfig, SRConfig, DnCNNConfig
+from config import TrainConfig, SegConfig
 from dataset import build_train_val_datasets
 from models.multitask_unet import build_seg_model
-from models.dncnn import load_dncnn
-from models.sr_gan import load_sr_model
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -66,30 +60,30 @@ class CombinedSegLoss(nn.Module):
 
 class MultiTaskLoss(nn.Module):
     """
-    L = w_A × (Dice+CE)_lobe  +  w_B × (Dice+CE)_lesion
+    L = w_A × (Dice+CE)_pathology  +  w_B × (Dice+CE)_infection
 
-    If has_lobes is False, lobe loss is zeroed → only lesion trains.
+    Both heads are ALWAYS trained (unlike the old version that disabled Task A).
     """
 
-    def __init__(self, cfg: TrainConfig, device: torch.device, has_lobes: bool = False):
+    def __init__(self, cfg: TrainConfig, device: torch.device):
         super().__init__()
-        self.w_a = cfg.task_a_weight if has_lobes else 0.0
+        self.w_a = cfg.task_a_weight  # always > 0
         self.w_b = cfg.task_b_weight
-        self.has_lobes = has_lobes
 
-        self.loss_lobe = CombinedSegLoss(
-            6, torch.tensor(cfg.lobe_ce_weights, device=device)
-        )
-        self.loss_lesion = CombinedSegLoss(
-            2, torch.tensor(cfg.lesion_ce_weights, device=device)
-        )
+        # Task A: 4-class pathology (BG, GGO, Consolidation, PE)
+        pathology_weights = torch.tensor([0.5, 2.0, 3.0, 3.0], device=device)
+        self.loss_pathology = CombinedSegLoss(4, pathology_weights)
 
-        if not has_lobes:
-            print("[loss] ⚠ No lobe annotations — Task A weight set to 0.0")
+        # Task B: 2-class infection (Healthy, Infected)
+        infection_weights = torch.tensor(cfg.lesion_ce_weights, device=device)
+        self.loss_infection = CombinedSegLoss(2, infection_weights)
 
-    def forward(self, lobe_logits, lesion_logits, lobe_target, lesion_target):
-        l_a = self.loss_lobe(lobe_logits, lobe_target) if self.has_lobes else torch.tensor(0.0)
-        l_b = self.loss_lesion(lesion_logits, lesion_target)
+        print(f"[loss] Task A (pathology, 4-class) weight={self.w_a:.1f}")
+        print(f"[loss] Task B (infection, binary)   weight={self.w_b:.1f}")
+
+    def forward(self, path_logits, inf_logits, path_target, inf_target):
+        l_a = self.loss_pathology(path_logits, path_target)
+        l_b = self.loss_infection(inf_logits, inf_target)
         total = self.w_a * l_a + self.w_b * l_b
         return total, l_a, l_b
 
@@ -115,85 +109,66 @@ def mean_dice(logits, target, num_classes):
 #  Epoch Runners
 # ═══════════════════════════════════════════════════════════════════════════
 
-def train_one_epoch(model, enhancement, loader, criterion, optimizer, scaler, device, epoch):
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch,
+                    accum_steps=4):
+    """Train one epoch with gradient accumulation for low-VRAM GPUs."""
     model.train()
-    run = {"total": 0., "lobe": 0., "lesion": 0.}
+    run = {"total": 0., "pathology": 0., "infection": 0.}
     n = 0
+    optimizer.zero_grad(set_to_none=True)
+
     for i, batch in enumerate(loader):
         imgs = batch["image"].to(device, non_blocking=True)
-        lobe_m = batch["lobe_mask"].to(device, non_blocking=True)
-        les_m = batch["lesion_mask"].to(device, non_blocking=True)
+        path_m = batch["lobe_mask"].to(device, non_blocking=True)    # pathology mask (0,1,2,3)
+        inf_m = batch["lesion_mask"].to(device, non_blocking=True)   # binary infection
 
-        # Enhancement pipeline (frozen DnCNN → downsample → SRGAN)
-        if enhancement is not None:
-            with torch.no_grad():
-                orig_size = imgs.shape[-2:]
-                for stage in enhancement:
-                    # If this is the SRGAN stage, downsample first (256→512 training)
-                    if hasattr(stage, 'upsample'):  # SRGenerator has .upsample
-                        imgs = nn.functional.interpolate(
-                            imgs, size=(256, 256), mode="bilinear", align_corners=False)
-                    imgs = stage(imgs)
-                    imgs = torch.clamp(imgs, 0.0, 1.0)
-                # Ensure output matches mask spatial dims
-                if imgs.shape[-2:] != orig_size:
-                    imgs = nn.functional.interpolate(
-                        imgs, size=orig_size, mode="bilinear", align_corners=False)
-
-        optimizer.zero_grad(set_to_none=True)
-        with autocast(device_type="cuda", enabled=(device.type == "cuda")):
-            lobe_log, les_log = model(imgs)
-            total, l_a, l_b = criterion(lobe_log, les_log, lobe_m, les_m)
+        with autocast('cuda', enabled=(device.type == "cuda")):
+            path_log, inf_log = model(imgs)
+            total, l_a, l_b = criterion(path_log, inf_log, path_m, inf_m)
+            total = total / accum_steps  # scale loss for accumulation
 
         scaler.scale(total).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
 
-        run["total"] += total.item()
-        run["lobe"] += l_a.item() if isinstance(l_a, torch.Tensor) else l_a
-        run["lesion"] += l_b.item()
+        if (i + 1) % accum_steps == 0 or (i + 1) == len(loader):
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        run["total"] += total.item() * accum_steps  # unscale for logging
+        run["pathology"] += l_a.item()
+        run["infection"] += l_b.item()
         n += 1
 
-        if (i + 1) % 10 == 0:
-            print(f"  [E{epoch}] batch {i+1}/{len(loader)}  loss={run['total']/n:.4f}")
+        if (i + 1) % 20 == 0:
+            print(f"  [E{epoch}] batch {i+1}/{len(loader)}  "
+                  f"loss={run['total']/n:.4f} path={run['pathology']/n:.4f} "
+                  f"inf={run['infection']/n:.4f}")
 
     return {k: v / max(n, 1) for k, v in run.items()}
 
 
 @torch.no_grad()
-def validate(model, enhancement, loader, criterion, device, has_lobes):
+def validate(model, loader, criterion, device):
     model.eval()
-    run = {"total": 0., "lobe": 0., "lesion": 0., "dice_lobe": 0., "dice_lesion": 0.}
+    run = {"total": 0., "pathology": 0., "infection": 0.,
+           "dice_pathology": 0., "dice_infection": 0.}
     n = 0
     for batch in loader:
         imgs = batch["image"].to(device, non_blocking=True)
-        lobe_m = batch["lobe_mask"].to(device, non_blocking=True)
-        les_m = batch["lesion_mask"].to(device, non_blocking=True)
+        path_m = batch["lobe_mask"].to(device, non_blocking=True)
+        inf_m = batch["lesion_mask"].to(device, non_blocking=True)
 
-        if enhancement is not None:
-            orig_size = imgs.shape[-2:]
-            for stage in enhancement:
-                if hasattr(stage, 'upsample'):
-                    imgs = nn.functional.interpolate(
-                        imgs, size=(256, 256), mode="bilinear", align_corners=False)
-                imgs = stage(imgs)
-                imgs = torch.clamp(imgs, 0.0, 1.0)
-            if imgs.shape[-2:] != orig_size:
-                imgs = nn.functional.interpolate(
-                    imgs, size=orig_size, mode="bilinear", align_corners=False)
-
-        with autocast(device_type="cuda", enabled=(device.type == "cuda")):
-            lobe_log, les_log = model(imgs)
-            total, l_a, l_b = criterion(lobe_log, les_log, lobe_m, les_m)
+        with autocast('cuda', enabled=(device.type == "cuda")):
+            path_log, inf_log = model(imgs)
+            total, l_a, l_b = criterion(path_log, inf_log, path_m, inf_m)
 
         run["total"] += total.item()
-        run["lobe"] += l_a.item() if isinstance(l_a, torch.Tensor) else l_a
-        run["lesion"] += l_b.item()
-        if has_lobes:
-            run["dice_lobe"] += mean_dice(lobe_log, lobe_m, 6)
-        run["dice_lesion"] += mean_dice(les_log, les_m, 2)
+        run["pathology"] += l_a.item()
+        run["infection"] += l_b.item()
+        run["dice_pathology"] += mean_dice(path_log, path_m, 4)
+        run["dice_infection"] += mean_dice(inf_log, inf_m, 2)
         n += 1
 
     return {k: v / max(n, 1) for k, v in run.items()}
@@ -231,49 +206,44 @@ def main(args):
         num_workers=tcfg.num_workers, pin_memory=True,
     )
 
-    # Detect lobe availability from the underlying dataset
-    base_ds = train_ds.dataset if hasattr(train_ds, 'dataset') else train_ds
-    has_lobes = getattr(base_ds, 'has_lobes', False)
-
     # ── Model ────────────────────────────────────────────────────────────
     seg_cfg = SegConfig(low_vram=args.low_vram)
     model = build_seg_model(seg_cfg).to(device)
 
-    # ── Enhancement pipeline (optional) ──────────────────────────────────
-    enhancement = None
-    if args.use_enhancement:
-        stages = []
-        if args.dncnn_weights:
-            dncnn = load_dncnn(args.dncnn_weights, DnCNNConfig(), device)
-            for p in dncnn.parameters(): p.requires_grad_(False)
-            stages.append(dncnn)
-        if args.sr_weights:
-            srgan = load_sr_model(args.sr_weights, SRConfig(), device)
-            for p in srgan.parameters(): p.requires_grad_(False)
-            stages.append(srgan)
-        if stages:
-            enhancement = stages
-            print(f"[train] Enhancement pipeline: {len(stages)} frozen stages")
+    # ── Resume from checkpoint ───────────────────────────────────────────
+    start_epoch = 1
+    best_dice = 0.0
+    if args.resume:
+        print(f"[train] Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        state = ckpt.get("model_state_dict", ckpt)
+        model.load_state_dict(state, strict=True)
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_dice = ckpt.get("best_dice", 0.0)
+        print(f"[train] Resumed at epoch {start_epoch}, best_dice={best_dice:.4f}")
 
     # ── Loss / Opt / Scheduler ───────────────────────────────────────────
-    criterion = MultiTaskLoss(tcfg, device, has_lobes=has_lobes)
+    criterion = MultiTaskLoss(tcfg, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=tcfg.scheduler_T0, T_mult=tcfg.scheduler_Tmult,
         eta_min=tcfg.scheduler_eta_min,
     )
-    scaler = GradScaler(enabled=(device.type == "cuda"))
+    scaler = GradScaler('cuda', enabled=(device.type == "cuda"))
 
     # ── Checkpointing ────────────────────────────────────────────────────
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_dice = 0.0
 
-    for epoch in range(1, tcfg.epochs + 1):
+    print(f"\n[train] Starting training: {tcfg.epochs} epochs, "
+          f"batch_size={tcfg.batch_size}, lr={tcfg.lr}")
+    print(f"[train] Train: {len(train_ds)} samples, Val: {len(val_ds)} samples\n")
+
+    for epoch in range(start_epoch, tcfg.epochs + 1):
         t0 = time.time()
-        tr = train_one_epoch(model, enhancement, train_loader, criterion,
+        tr = train_one_epoch(model, train_loader, criterion,
                              optimizer, scaler, device, epoch)
-        vl = validate(model, enhancement, val_loader, criterion, device, has_lobes)
+        vl = validate(model, val_loader, criterion, device)
         scheduler.step()
         dt = time.time() - t0
 
@@ -281,16 +251,13 @@ def main(args):
         print(
             f"[E{epoch:03d}/{tcfg.epochs}] "
             f"trn={tr['total']:.4f} | "
-            f"val={vl['total']:.4f} DLobe={vl['dice_lobe']:.4f} "
-            f"DLesion={vl['dice_lesion']:.4f} | "
+            f"val={vl['total']:.4f} DPath={vl['dice_pathology']:.4f} "
+            f"DInf={vl['dice_infection']:.4f} | "
             f"lr={lr:.2e} | {dt:.1f}s"
         )
 
-        # Best model (weight lobe 60%, lesion 40% — or just lesion if no lobes)
-        if has_lobes:
-            combined = 0.6 * vl["dice_lobe"] + 0.4 * vl["dice_lesion"]
-        else:
-            combined = vl["dice_lesion"]
+        # Best model (weight pathology 60%, infection 40%)
+        combined = 0.6 * vl["dice_pathology"] + 0.4 * vl["dice_infection"]
 
         if combined > best_dice:
             best_dice = combined
@@ -299,7 +266,6 @@ def main(args):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_dice": best_dice,
-                "has_lobes": has_lobes,
                 "config": {"seg": vars(seg_cfg), "train": vars(tcfg)},
             }, ckpt_dir / "best_model.pth")
             print(f"  ✓ Best model saved (Dice = {best_dice:.4f})")
@@ -319,7 +285,7 @@ def main(args):
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Train Multi-Task U-Net (Step 4)")
+    p = argparse.ArgumentParser("Train Multi-Task U-Net Segmentation")
 
     p.add_argument("--data_dir", default="./data")
     p.add_argument("--use_npy", action="store_true")
@@ -329,17 +295,16 @@ def parse_args():
 
     p.add_argument("--low_vram", action="store_true")
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=2)
 
-    p.add_argument("--task_a_weight", type=float, default=1.0)
-    p.add_argument("--task_b_weight", type=float, default=2.0)
+    p.add_argument("--task_a_weight", type=float, default=1.0,
+                    help="Weight for pathology loss (Task A)")
+    p.add_argument("--task_b_weight", type=float, default=2.0,
+                    help="Weight for infection loss (Task B)")
 
-    p.add_argument("--use_enhancement", action="store_true")
-    p.add_argument("--dncnn_weights", default="weights/dncnn2d_epoch_0240.pth")
-    p.add_argument("--sr_weights", default="weights/best_sr_gan_model.pth")
-
+    p.add_argument("--resume", default=None, help="Resume from checkpoint path")
     p.add_argument("--ckpt_dir", default="./checkpoints")
 
     return p.parse_args()

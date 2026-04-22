@@ -147,77 +147,86 @@ class LungSeverityPipeline:
     @torch.no_grad()
     def predict_volume(self, volume_3d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
-        Run Steps 0–4 slice-by-slice on a full 3D volume.
+        Run Steps 0–4 on a full 3D volume.
+
+        Memory strategy for low-VRAM GPUs (4GB RTX 2050):
+            - Only one model on GPU at a time
+            - Process slices one-by-one
+            - Free GPU memory between model stages
 
         Returns
         -------
-        pathology_mask : ndarray [H, W, D] int16 (0=BG, 1=GGO, 2=Consolidation, 3=PE)
-        infection_mask : ndarray [H, W, D] int16 (0=Healthy, 1=Infected)
+        pathology_mask : ndarray [H, W, D] int16
+        infection_mask : ndarray [H, W, D] int16
         """
         orig_h, orig_w, n_slices = volume_3d.shape
-        ts = self.target_size  # 512
+        ts = self.target_size
+        use_cuda = self.device.type == "cuda"
 
-        pathology_3d = np.zeros((orig_h, orig_w, n_slices), dtype=np.int16)
-        infection_3d = np.zeros((orig_h, orig_w, n_slices), dtype=np.int16)
+        # ── Step 0: Preprocess ALL slices to CPU buffer ──────────────
+        print(f"  Preprocessing {n_slices} slices...")
+        enhanced = torch.zeros(n_slices, 1, ts, ts)
+        for s in range(n_slices):
+            processed = preprocess_slice(volume_3d[:, :, s], ts)
+            enhanced[s, 0] = torch.from_numpy(processed)
 
-        for start in range(0, n_slices, self.batch_size):
-            end = min(start + self.batch_size, n_slices)
+        # ── Step 1: DnCNN (one slice at a time) ──────────────────────
+        if self.dncnn is not None:
+            print(f"  Running DnCNN on {n_slices} slices...")
+            self.dncnn.to(self.device)
+            for s in range(n_slices):
+                x = enhanced[s:s+1].to(self.device)
+                with autocast('cuda', enabled=use_cuda):
+                    x = self.dncnn(x).clamp(0, 1)
+                enhanced[s] = x.cpu()
+            self.dncnn.cpu()
+            if use_cuda:
+                torch.cuda.empty_cache()
 
-            # ── Step 0: Preprocess each slice ────────────────────────
-            batch = []
-            for s in range(start, end):
-                processed = preprocess_slice(volume_3d[:, :, s], ts)
-                batch.append(torch.from_numpy(processed).unsqueeze(0))  # [1, 512, 512]
-
-            x = torch.stack(batch, dim=0).to(self.device)  # [B, 1, 512, 512]
-
-            with autocast('cuda', enabled=(self.device.type == "cuda")):
-
-                # ── Step 1: DnCNN denoising (512→512) ────────────────
-                # Input: noisy [B, 1, 512, 512]
-                # Output: clean but blurry [B, 1, 512, 512]
-                if self.dncnn is not None:
-                    x = self.dncnn(x)
-                    x = torch.clamp(x, 0.0, 1.0)  # keep in [0,1]
-
-                # ── Step 2: SRGAN super-resolution (256→512) ─────────
-                # The SRGAN was trained via self-degradation:
-                #   training: degrade 512→256, then SRGAN learns 256→512
-                #   inference: downsample DnCNN output → SRGAN → sharp 512
-                if self.srgan is not None:
-                    # Downsample to what SRGAN expects (256×256)
+        # ── Step 2: SRGAN (one slice at a time) ──────────────────────
+        if self.srgan is not None:
+            print(f"  Running SRGAN on {n_slices} slices...")
+            self.srgan.to(self.device)
+            for s in range(n_slices):
+                x = enhanced[s:s+1].to(self.device)
+                with autocast('cuda', enabled=use_cuda):
                     x_low = F.interpolate(
                         x, size=(self.sr_input_size, self.sr_input_size),
                         mode="bilinear", align_corners=False
                     )
-                    # SRGAN: 256 → 512  (PixelShuffle 2×)
-                    x = self.srgan(x_low)
-                    x = torch.clamp(x, 0.0, 1.0)
-
-                    # Safety: ensure output is exactly target_size
+                    x = self.srgan(x_low).clamp(0, 1)
                     if x.shape[-1] != ts or x.shape[-2] != ts:
                         x = F.interpolate(x, size=(ts, ts),
                                           mode="bilinear", align_corners=False)
+                enhanced[s] = x.cpu()
+            self.srgan.cpu()
+            if use_cuda:
+                torch.cuda.empty_cache()
 
-                # ── Step 4: Segmentation (512→512) ───────────────────
-                pathology_logits, infection_logits = self.seg_model(x)
+        # ── Step 4: Segmentation (one slice at a time) ───────────────
+        print(f"  Running segmentation on {n_slices} slices...")
+        self.seg_model.to(self.device)
+        pathology_3d = np.zeros((orig_h, orig_w, n_slices), dtype=np.int16)
+        infection_3d = np.zeros((orig_h, orig_w, n_slices), dtype=np.int16)
 
-            # Argmax → class labels
-            pathology_preds = pathology_logits.argmax(dim=1)   # [B, 512, 512]
-            infection_preds = infection_logits.argmax(dim=1)   # [B, 512, 512]
+        for s in range(n_slices):
+            x = enhanced[s:s+1].to(self.device)
+            with autocast('cuda', enabled=use_cuda):
+                path_logits, inf_logits = self.seg_model(x)
 
-            # Resize predictions back to original volume spatial dims
-            pathology_full = F.interpolate(
-                pathology_preds.unsqueeze(1).float(), (orig_h, orig_w), mode="nearest"
-            ).squeeze(1).cpu().numpy().astype(np.int16)
+            pathology_3d[:, :, s] = F.interpolate(
+                path_logits.argmax(dim=1).unsqueeze(1).float(),
+                (orig_h, orig_w), mode="nearest"
+            ).squeeze().cpu().numpy().astype(np.int16)
 
-            infection_full = F.interpolate(
-                infection_preds.unsqueeze(1).float(), (orig_h, orig_w), mode="nearest"
-            ).squeeze(1).cpu().numpy().astype(np.int16)
+            infection_3d[:, :, s] = F.interpolate(
+                inf_logits.argmax(dim=1).unsqueeze(1).float(),
+                (orig_h, orig_w), mode="nearest"
+            ).squeeze().cpu().numpy().astype(np.int16)
 
-            for i, s in enumerate(range(start, end)):
-                pathology_3d[:, :, s] = pathology_full[i]
-                infection_3d[:, :, s] = infection_full[i]
+        self.seg_model.cpu()
+        if use_cuda:
+            torch.cuda.empty_cache()
 
         return pathology_3d, infection_3d
 
@@ -357,20 +366,21 @@ def process_single(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[pipeline] Device: {device}\n")
 
-    # ── Load models ──────────────────────────────────────────────────────
+    # ── Load models (to CPU — moved to GPU one at a time in predict_volume) ──
+    cpu = torch.device("cpu")
     dncnn = None
     if not args.no_dncnn:
         print("[Step 1] Loading DnCNN denoiser...")
-        dncnn = load_dncnn(args.dncnn_weights, DnCNNConfig(), device)
+        dncnn = load_dncnn(args.dncnn_weights, DnCNNConfig(), cpu)
 
     srgan = None
     if not args.no_sr:
         print("[Step 2] Loading SRGAN super-resolver...")
-        srgan = load_sr_model(args.sr_weights, SRConfig(), device)
+        srgan = load_sr_model(args.sr_weights, SRConfig(), cpu)
 
     print("[Step 4] Loading segmentation model...")
     seg_cfg = SegConfig(low_vram=args.low_vram)
-    seg_model = load_seg_model(args.seg_weights, seg_cfg, device)
+    seg_model = load_seg_model(args.seg_weights, seg_cfg, cpu)
 
     pipe = LungSeverityPipeline(
         dncnn=dncnn, srgan=srgan, seg_model=seg_model,

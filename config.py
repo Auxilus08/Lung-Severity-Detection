@@ -110,8 +110,8 @@ class SRConfig:
     """Step 2: SRGAN Generator configuration."""
     in_channels: int   = 1
     out_channels: int  = 1
-    num_filters: int   = 64       # base filter width
-    num_residual_blocks: int = 16 # residual blocks in the generator
+    num_filters: int   = 96       # base filter width (matches trained checkpoint)
+    num_residual_blocks: int = 20 # 20 residual blocks (matches trained checkpoint)
     upscale_factor: int = 2       # 2× super-resolution (256→512)
 
 

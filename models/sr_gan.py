@@ -2,23 +2,17 @@
 models/sr_gan.py — SRGAN Generator for 2D CT Slice Super-Resolution
 =====================================================================
 
-Architecture: SRResNet-style generator
-    Input  → Conv 9×9 → PReLU
-    → N × Residual Block (Conv 3×3, BN, PReLU, Conv 3×3, BN + skip)
-    → Conv 3×3 → BN + skip (to post-initial feature map)
-    → Upsampling Block(s) via PixelShuffle (sub-pixel convolution)
-    → Conv 9×9 → output
+Architecture matched to the trained checkpoint (checkpoint_epoch0060.pth):
+    Input  → Conv 9×9 → PReLU             (self.initial_conv)
+    → 20 × Residual Block                 (self.res_blocks)
+    → Conv 3×3 → BN + skip               (self.post_res_conv)
+    → UpsampleBlock via PixelShuffle 2×   (self.upsample)
+    → Conv 9×9 → output                   (self.final_conv)
 
-Default: 2× upsampling, 1-channel in/out (grayscale CT), 16 residual blocks.
+Config: in_channels=1, out_channels=1, num_filters=64, num_residual_blocks=20, upscale_factor=2
 
 Reference: Ledig et al., "Photo-Realistic Single Image Super-Resolution
            Using a Generative Adversarial Network" (CVPR 2017).
-
-NOTE: The architecture defined here must EXACTLY match the one used to
-      train your `best_sr_gan_model.pth` checkpoint.  If your generator
-      was trained with different num_filters/num_residual_blocks/upscale_factor,
-      3
-      update SRConfig in config.py accordingly.
 """
 
 from __future__ import annotations
@@ -46,7 +40,7 @@ class ResidualBlock(nn.Module):
         self.block = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
-            nn.PReLU(num_parameters=channels),
+            nn.PReLU(),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
         )
@@ -67,7 +61,7 @@ class UpsampleBlock(nn.Module):
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.PixelShuffle(scale_factor),
-            nn.PReLU(num_parameters=in_channels),
+            nn.PReLU(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -82,6 +76,13 @@ class SRGenerator(nn.Module):
     """
     SRResNet-style generator for single-channel medical image super-resolution.
 
+    Variable names match the trained checkpoint exactly:
+        self.initial_conv   → checkpoint keys: initial_conv.*
+        self.res_blocks     → checkpoint keys: res_blocks.*
+        self.post_res_conv  → checkpoint keys: post_res_conv.*
+        self.upsample       → checkpoint keys: upsample.block.*
+        self.final_conv     → checkpoint keys: final_conv.*
+
     Parameters
     ----------
     in_channels : int
@@ -91,9 +92,9 @@ class SRGenerator(nn.Module):
     num_filters : int
         Base number of convolutional filters (default 64).
     num_residual_blocks : int
-        Number of residual blocks (default 16).
+        Number of residual blocks (default 20 for this checkpoint).
     upscale_factor : int
-        Super-resolution factor. Must be a power of 2 (default 2).
+        Super-resolution factor (default 2).
 
     Shape
     -----
@@ -106,42 +107,54 @@ class SRGenerator(nn.Module):
         in_channels: int = 1,
         out_channels: int = 1,
         num_filters: int = 64,
-        num_residual_blocks: int = 16,
+        num_residual_blocks: int = 20,
         upscale_factor: int = 2,
     ):
         super().__init__()
         assert upscale_factor in (2, 4, 8), "upscale_factor must be 2, 4, or 8"
 
         # ── Initial feature extraction ───────────────────────────────────
-        self.initial = nn.Sequential(
+        # Checkpoint keys: initial_conv.0.weight, initial_conv.0.bias, initial_conv.1.weight
+        self.initial_conv = nn.Sequential(
             nn.Conv2d(in_channels, num_filters, kernel_size=9, padding=4),
-            nn.PReLU(num_parameters=num_filters),
+            nn.PReLU(),
         )
 
         # ── Residual trunk ───────────────────────────────────────────────
-        self.residual_blocks = nn.Sequential(
+        # Checkpoint keys: res_blocks.{0..19}.block.*
+        self.res_blocks = nn.Sequential(
             *[ResidualBlock(num_filters) for _ in range(num_residual_blocks)]
         )
-        self.post_residual = nn.Sequential(
+        # Checkpoint keys: post_res_conv.0.weight, post_res_conv.1.*
+        self.post_res_conv = nn.Sequential(
             nn.Conv2d(num_filters, num_filters, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(num_filters),
         )
 
-        # ── Upsampling (one block per 2× factor) ────────────────────────
-        n_upsample = int(math.log2(upscale_factor))
-        self.upsample = nn.Sequential(
-            *[UpsampleBlock(num_filters, scale_factor=2) for _ in range(n_upsample)]
-        )
+        # ── Upsampling (single block for 2×) ─────────────────────────────
+        # Checkpoint keys: upsample.block.{0,2}.*
+        # For 2× upscale: single UpsampleBlock (not wrapped in Sequential)
+        # For 4×: would need two blocks
+        if upscale_factor == 2:
+            self.upsample = UpsampleBlock(num_filters, scale_factor=2)
+        else:
+            n_upsample = int(math.log2(upscale_factor))
+            self.upsample = nn.Sequential(
+                *[UpsampleBlock(num_filters, scale_factor=2) for _ in range(n_upsample)]
+            )
 
         # ── Final reconstruction ─────────────────────────────────────────
-        self.final = nn.Conv2d(num_filters, out_channels, kernel_size=9, padding=4)
+        # Checkpoint keys: final_conv.0.weight, final_conv.0.bias
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(num_filters, out_channels, kernel_size=9, padding=4),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        initial_features = self.initial(x)
-        trunk = self.residual_blocks(initial_features)
-        trunk = self.post_residual(trunk) + initial_features   # global skip
+        initial_features = self.initial_conv(x)
+        trunk = self.res_blocks(initial_features)
+        trunk = self.post_res_conv(trunk) + initial_features   # global skip
         upsampled = self.upsample(trunk)
-        return self.final(upsampled)
+        return self.final_conv(upsampled)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -192,7 +205,7 @@ def load_sr_model(
 # ── Quick test ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     model = build_sr_model()
-    x = torch.randn(1, 1, 128, 128)
+    x = torch.randn(1, 1, 256, 256)
     y = model(x)
     print(f"  Input:  {x.shape}")
     print(f"  Output: {y.shape}  (2× super-resolved)")

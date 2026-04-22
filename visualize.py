@@ -207,13 +207,22 @@ def main(args):
     pred = Path(args.pred_dir)
     lobe_vol, lesion_vol = None, None
 
+    # Try new names first (pathology/infection), then old names (lobe/lesion)
+    pathology_path = pred / "pathology_mask.nii.gz"
     lobe_path = pred / "lobe_mask.nii.gz"
-    if lobe_path.exists():
+    if pathology_path.exists():
+        lobe_vol = nib.load(str(pathology_path)).get_fdata().astype(np.int16)
+        print(f"  Pathology: {pathology_path.name}  labels={np.unique(lobe_vol).tolist()}")
+    elif lobe_path.exists():
         lobe_vol = nib.load(str(lobe_path)).get_fdata().astype(np.int16)
         print(f"  Lobes:  {lobe_path.name}  labels={np.unique(lobe_vol).tolist()}")
 
+    infection_path = pred / "infection_mask.nii.gz"
     lesion_path = pred / "lesion_mask.nii.gz"
-    if lesion_path.exists():
+    if infection_path.exists():
+        lesion_vol = nib.load(str(infection_path)).get_fdata().astype(np.int16)
+        print(f"  Infection: {infection_path.name}  labels={np.unique(lesion_vol).tolist()}")
+    elif lesion_path.exists():
         lesion_vol = nib.load(str(lesion_path)).get_fdata().astype(np.int16)
         print(f"  Lesion: {lesion_path.name}  labels={np.unique(lesion_vol).tolist()}")
 

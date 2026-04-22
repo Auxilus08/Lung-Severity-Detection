@@ -150,23 +150,25 @@ class SegSliceDataset(Dataset):
         image = self.images[i].copy()                     # [1, H, W] float32
         pathology_mask = self.masks[i].copy()              # [H, W] int
 
-        # Task A: Lobe mask
+        # Task A: Pathology mask (0=BG, 1=GGO, 2=Consolidation, 3=PE)
+        # If lobe annotations exist, use those; otherwise use pathology labels
         if self.has_lobes:
             lobe_mask = self.lobes[i].copy().astype(np.int64)
         else:
-            lobe_mask = np.zeros_like(pathology_mask, dtype=np.int64)
+            # Use the pathology mask directly for Task A
+            lobe_mask = pathology_mask.astype(np.int64)
 
         # Task B: Binary lesion mask (any pathology ≥ 1 → infected)
         lesion_mask = (pathology_mask > 0).astype(np.int64)
 
         sample = {
-            "image": image.astype(np.float32),
-            "lobe_mask": lobe_mask,
-            "lesion_mask": lesion_mask,
+            "image": image.astype(np.float32),                    # [1, H, W]
+            "lobe_mask": lobe_mask[np.newaxis].astype(np.float32),  # [1, H, W] for MONAI
+            "lesion_mask": lesion_mask[np.newaxis].astype(np.float32),  # [1, H, W]
         }
         sample = self.transforms(sample)
-        sample["lobe_mask"] = sample["lobe_mask"].long()
-        sample["lesion_mask"] = sample["lesion_mask"].long()
+        sample["lobe_mask"] = sample["lobe_mask"].squeeze(0).long()
+        sample["lesion_mask"] = sample["lesion_mask"].squeeze(0).long()
         return sample
 
 
